@@ -1,318 +1,322 @@
+# Tank Trouble 服务端 & 客户端（TTapi）说明
 
----
+> 一进程多线程运行：
+>
+> * 登录/注册 HTTP：`0.0.0.0:25000`
+> * 房间 HTTP：`0.0.0.0:25002`
+> * WebSocket（游戏推送）：`0.0.0.0:25001`（Flask-SocketIO）
 
-markdown
-# TTapi/README.md
-
-# Tank Trouble 客户端模块（TTapi.py）调用手册
-
-本文档面向接入方/插件作者，介绍 `TTapi.py` 的安装、核心类与方法、事件回调、返回码语义与示例代码，帮助你快速完成登录、拉取房间列表、加入/退出房间、订阅实时状态等功能。
+* 数据持久化：**MySQL**（`users` 表，含 `is_ban`）
+* Token：内存字典 + 过期堆 + 空闲回收（后台清理线程，30s 一轮）
+* 管理后台：`/admin/*`，带 CSRF、登录、用户管理、Token 管理、房间监控、导出等
+* 模板：`templates/admin/`（已提供美化版；不改后端接口）
 
 ---
 
 ## 目录
 
-- [安装与依赖](#安装与依赖)
-- [快速上手示例](#快速上手示例)
-- [配置项与常量](#配置项与常量)
-- [核心概念](#核心概念)
-- [User 类：属性与方法](#user-类属性与方法)
-  - [属性](#属性)
-  - [事件回调 API](#事件回调-api)
-  - [自动刷新房间列表](#自动刷新房间列表)
-  - [账号相关](#账号相关)
-  - [房间相关](#房间相关)
-  - [WebSocket 连接](#websocket-连接)
-- [返回码对照表](#返回码对照表)
-- [数据结构](#数据结构)
-- [最佳实践与注意事项](#最佳实践与注意事项)
-- [Admin 类](#admin-类)
-- [附：增量同步协议](#附增量同步协议)
+* [环境与依赖](#环境与依赖)
+* [数据库初始化](#数据库初始化)
+* [配置](#配置)
+* [启动](#启动)
+* [管理后台](#管理后台)
+* [HTTP API](#http-api)
+* [WebSocket 协议](#websocket-协议)
+* [TTapi 客户端用法](#ttapi-客户端用法)
+* [返回码对照表](#返回码对照表)
+* [故障排查](#故障排查)
+* [安全与上线建议](#安全与上线建议)
 
 ---
 
-## 安装与依赖
+## 环境与依赖
 
-- Python 3.9+
-- 依赖：
-  - `requests`
-  - `python-socketio`
+* Python ≥ 3.9（开发环境可用 3.13）
+* MySQL 5.7/8.x
 
-安装示例：
+安装依赖（按你实际 `requirements.txt` 为准，示例）：
+
 ```bash
-pip install requests "python-socketio[client]"
-````
+pip install flask flask-socketio eventlet requests pymysql bcrypt
+```
+
+> 如用 gevent，请相应调整 `async_mode`；默认使用 `eventlet/threading`。
 
 ---
 
-## 快速上手示例
+## 数据库初始化
 
-```python
-from TTapi import User
+服务端启动时会执行 `ensure_schema()` 兜底建表（至少包含 `users` 表）。
+`users` 表字段（示例）：
 
-# 1) 创建用户实例
-u = User(username="Alice_01", password="Abc12345")
+| 字段             | 类型              | 说明        |
+| -------------- | --------------- | --------- |
+| uid (PK, AI)   | BIGINT UNSIGNED | 用户ID      |
+| username (UK)  | VARCHAR(64)     | 用户名       |
+| password\_hash | VARCHAR(100)    | Bcrypt 哈希 |
+| ip             | VARCHAR(45)     | 注册IP      |
+| is\_ban        | TINYINT(1)      | 是否封禁(0/1) |
+| created\_at    | TIMESTAMP       | 创建时间      |
+| updated\_at    | TIMESTAMP       | 更新时间      |
 
-# 2) 注册（首次）或直接登录
-ret = u.register()   # 可能返回 "username_exist" 等
-print("register:", ret)
-
-ret = u.login()
-print("login:", ret)
-
-# 3) 绑定房间列表自动刷新回调（已登录且不在房间时，每2秒拉取）
-def on_rooms(rooms, user):
-    print("[rooms]", rooms)
-
-u.bind_roomlist_update(on_rooms)
-u.start_auto_refresh(interval=2.0)
-
-# 4) 创建房间或加入已有房间
-ret = u.create_room(playermax=4)
-print("create_room:", ret)
-
-# 或：加入房间
-# u.join_room(room_id=1)
-
-# 5) 绑定 socket 事件
-def on_join(payload, user):
-    print("[join_room]", payload["status"], "room_id=", payload["data"]["room_id"])
-user_cb = lambda p, usr: print("[room_update]", p.get("type"), "players=", len(p["data"]["players"]))
-u.on("join_room", on_join)
-u.on("room_update", user_cb)
-
-# 6) 退出房间
-# u.leave_room()
-```
+> 管理后台若启用账号与审计，建议一并建：`admin_users`、`admin_audit_logs`（DDL 可参考注释或你的实现）。
 
 ---
 
-## 配置项与常量
+## 配置
 
-```python
-login_url = "http://localhost:25000/"
-game_url  = "http://localhost:25001/"
-room_url  = "http://localhost:25002/"
-ADMIN_TOKEN = "admin_token"
+根据你的实现，配置可通过环境变量或常量传入（以下为常见项，按你代码为准）：
 
-# 用户名/密码校验（本地预检）
-USERNAME_MIN_LEN = 3
-USERNAME_MAX_LEN = 16
-PASSWORD_MIN_LEN = 8
-PASSWORD_MAX_LEN = 16
-```
-
-> 生产环境请将 `login_url / game_url / room_url / ADMIN_TOKEN` 替换为你自己的地址与凭据。
-
----
-
-## 核心概念
-
-* **User**：客户端会话对象，封装登录态、HTTP 调用、SocketIO 事件处理等。
-* **轻量事件系统**：通过 `on/once/off` 绑定回调，可订阅 `connect/disconnect/join_room/room_update/game_update` 等事件。
-* **自动刷新房间列表**：当“已登录且不在任意房间”时，后台线程每隔 N 秒调用一次 `get_all_room_info(brief=1)`，并触发绑定回调。
-* **增量同步**：服务端每 5 秒全量推一次 `game_updata`，其余 tick 推差量。客户端用 `dict_patch` 应用补丁拿到最新状态。
+| 变量名                      | 默认值           | 说明                             |
+| ------------------------ | ------------- | ------------------------------ |
+| `MYSQL_HOST`             | 127.0.0.1     | MySQL 主机                       |
+| `MYSQL_PORT`             | 3306          | MySQL 端口                       |
+| `MYSQL_DB`               | tank\_trouble | 数据库名                           |
+| `MYSQL_USER`             | tt\_user      | 用户名                            |
+| `MYSQL_PASS`             | tt\_password  | 密码                             |
+| `ADMIN_TOKEN`            | …             | 管理 API 令牌（/admin\_get\_data 等） |
+| `MAX_TOKENS`             | 20000         | Token 池上限                      |
+| `TOKEN_TTL_SECONDS`      | 86400         | Token 有效期（秒）                   |
+| `TOKEN_IDLE_TTL_SECONDS` | 3600          | Token 空闲过期（秒）                  |
 
 ---
 
-## User 类：属性与方法
+## 启动
 
-### 属性
+服务端（在一个进程里多线程托起三个服务）：
 
-```python
-user.username: str
-user.password: str
-user.is_ban: bool                     # 预留
-user.token: Optional[str]             # 登录成功后获得
-user.uid: Optional[int]               # 登录成功后获得
-user.status: int                      # 0=未登录, 1=已登录
-user.room_data: Optional[dict]        # 最近一次房间全量/合成后的状态
-user.room: dict                       # 解析后的房间简易视图（等于 room_data）
-user.room_players: list               # 解析后的玩家列表
-user.rooms: list                      # 最近一次 get_all_room_info 的结果（brief 模式）
-user.sio: socketio.Client             # SocketIO 客户端实例
-user.is_online: bool                  # SocketIO 连接状态
-user.room_data_temp: dict             # 增量同步的“当前基线”
+```bash
+python server.py
 ```
 
-### 事件回调 API
+> 主线程跑 SocketIO(`:25001`)，子线程各跑一个 Flask（`:25000`, `:25002`）。
+> **注意**：务必关闭 Flask 自带 reloader（代码已关闭），避免多进程导致线程重复。
 
-```python
-user.on(event, func)     # 绑定回调；func(payload, user)
-user.once(event, func)   # 绑定一次性回调；触发后自动解绑
-user.off(event, func?)   # 解绑指定回调；省略 func 则解绑该事件的全部回调
+---
+
+## 管理后台
+
+* 登录页：`GET /admin/login` → 表单 `POST /admin/login`（带 `_csrf`）
+* 仪表盘：`GET /admin/`（用户数/在线 token/房间数）
+* 用户管理：`GET /admin/users`（搜索/分页）
+
+  * 重置密码：`POST /admin/users/<uid>/resetpw`（`_csrf`,`password`）
+  * 封禁/解禁：`POST /admin/users/<uid>/ban`（`_csrf`,`is_ban`=0/1）
+* Token 管理：`GET /admin/tokens`（可按 UID 过滤）
+
+  * 撤销某 token：`POST /admin/tokens/revoke`（`_csrf`,`token`）
+  * 撤销某 UID 全部 token：`POST /admin/tokens/revoke`（`_csrf`,`uid`）
+* 房间监控：`GET /admin/rooms`（空房可一键解散，`POST /admin/rooms/<room_id>/dismiss`）
+* 导出：`GET /admin/export`
+
+> 模板在 `templates/admin/`，已包含 `_base.html`、`_macros.html` 与四个页面。**后端无需改动**。
+
+---
+
+## HTTP API
+
+### 1）登录/注册服务（:25000）
+
+#### `POST /login`
+
+请求 JSON：
+
+```json
+{"username": "str", "password": "str"}
 ```
 
-建议的事件名：
+成功 (200)：
 
-* `connect` / `disconnect`
-* `auth_success`（由服务端发送到客户端时会以普通消息形式出现，通常在 `connect` 后即可视为鉴权通过）
-* `join_room` / `leave_room`
-* `room_update`  （房内成员变化）
-* `game_update`  （游戏状态差量/全量——在本模块中对应 `on_game_updata` 触发后转发为 `game_update`）
-
-> 注：底层已对服务端的 `room_update`/`room_updata` 名称差异做了兼容。
-
-### 自动刷新房间列表
-
-```python
-user.bind_roomlist_update(func)  # 设置 rooms 刷新回调；func(rooms, user)
-user.start_auto_refresh(interval=2.0, callback=None)  # 启动后台刷新线程
-user.stop_auto_refresh()         # 停止后台刷新
+```json
+{"status":102,"message":"Login successful! 登录成功","token":"<token>","uid":123}
 ```
 
-工作逻辑：
+失败 (200)：
 
-* 仅当 `status == 1`（已登录）且 `user.room` 为空（不在房间）时，才会调用 `get_all_room_info()`。
-* 默认间隔 `2.0` 秒，可自定义。
-* 若同时设置了 `bind_roomlist_update` 与 `start_auto_refresh(callback=...)`，以 `callback` 为准。
+* `100` 参数缺失
+* `101` 用户名或密码错误
+* `103` 用户被封禁（新增）
+* `500` 服务器错误
 
-### 账号相关
+#### `POST /register`
 
-#### `register() -> str`
+请求 JSON：
 
-* 本地校验：
-
-  * 用户名：`3~16` 位，仅允许字母/数字/下划线
-  * 密码：`8~16` 位，必须同时包含字母与数字（仅允许字母数字）
-* 可能返回：
-
-  * `"regis_success" | "username_exist" | "parameter_error" | "network_error" | "unknown_error" | "username_invalid" | "password_invalid"`
-
-#### `login() -> str`
-
-* 本地校验同上。
-* 成功则自动尝试 `SocketIO` 连接，并 **启动自动刷新房间列表**（若不在房间）。
-* 可能返回：
-
-  * `"login_success" | "parameter_error" | "password_error" | "network_error" | "unknown_error"`
-
-### 房间相关
-
-#### `get_all_room_info() -> Union[list, str]`
-
-* 需要已登录且 token 存在。
-* 请求服务端 `brief=1` 精简视图，结果写入 `user.rooms` 并返回。
-* 错误时返回：`"not_login" | "token_error" | "network_error" | "unknown_error"`
-
-返回列表示例：
-
-```python
-[
-  { "room_id": 1, "playermax": 6, "player_num": 2, "create_player_name": "Alice" },
-  ...
-]
+```json
+{"username":"str","password":"str"}
 ```
 
-#### `create_room(playermax=6) -> str`
+返回 (200)：
 
-* 成功后会自动通过 WebSocket 发送 `join_room` 进入该房。
-* 可能返回：
+* `202` 注册成功（返回 `token`,`uid`）
+* `201` 用户名已存在
+* `203` IP 注册过于频繁（限频 60s）
+* `204` 同一 IP 账号数超上限
+* `200` 参数缺失 / 无效请求
 
-  * `"create_success" | "not_login" | "token_error" | "room_full" | "player_in_room" | "network_error" | "unknown_error"`
+#### 管理兼容接口（面向旧工具/脚本）
 
-#### `join_room(room_id: int) -> Optional[str]`
+* `GET /admin_get_data?token=ADMIN_TOKEN[&include_tokens=1][&limit=1000][&offset=0]`
+  返回：
 
-* 通过 WebSocket 发送加入请求。
-* 成功后将触发 `on_join_room`，并更新 `room_data / room / room_players`。
-* 本方法本身不返回服务器码，建议结合事件回调监听。
+  ```json
+  {
+    "status":300,"message":"Admin page! 管理员页面",
+    "USER_DATABASE":[{"uid":1,"username":"u","password":"bcrypt-hash","ip":"...","is_ban":0}, ...],
+    "UIDMAX": 12345,
+    "users_count": 999,
+    "tokens_count": 88,
+    "TOKEN_DATABASE": { ... } // 当 include_tokens=1
+  }
+  ```
+* `POST /admin_send_data?token=ADMIN_TOKEN`
+  兼容性写入（慎用；DB 模式下一般仅用于导入工具）。
+* `GET /get_token?token=ADMIN_TOKEN`
+  `1000` 有效 / `1001` 无效，并可返回 `TOKEN_DATABASE`。
 
-#### `leave_room(room_id: Optional[int]=None)`
+---
 
-* 通过 WebSocket 发送退出请求。
-* `room_id` 为空时将读取当前 `user.room['room_id']`。
-* 成功将触发 `on_leave_room` 与自动刷新列表恢复。
+### 2）房间服务（:25002）
 
-#### `get_room_info(room_id: Optional[int]) -> Union[dict, str]`
+所有接口都需要 `?token=<登录返回的token>`。
 
-* 一般不必主动调用，因为进入房间后服务端会主动推送全量/差量。
-* 返回 `"room_not_exist"`/`"token_error"`/`"network_error"`/`"unknown_error"` 或 `dict`（全量房间）。
+#### `POST /create_room?token=...`
 
-### WebSocket 连接
+```json
+{"playermax": 4}
+```
 
-#### `connect()`
+返回：
 
-* 手动连接：`user.sio.connect(game_url, auth={'token': user.token})`
-* 一般无需手动调用，`login()` 成功后会自动连接。
+* `1000` 创建成功（返回房间 `data`）
+* `1001` token 无效
+* `1002` 参数缺失 / 房间满 / 已在其他房间
+
+#### `GET /get_room_info?token=...&room_id=1`
+
+* `1000` 获取成功（`data` 为房间详情）
+* `1001` token 无效
+* `1002` 参数缺失 / 房间不存在
+
+#### `GET /get_all_room_info?token=...[&brief=1]`
+
+* `brief=1` 返回精简列表
+* 返回 `1000`；错误同上
+
+> 兼容接口：`POST /game_ready`（已标注废弃，仍保留）
+
+---
+
+## WebSocket 协议（:25001）
+
+**连接**：
+客户端需以 `auth={'token': '<登录 token>'}` 连接 Socket.IO。
+
+事件：
+
+* 服务端 → 客户端
+
+  * `auth_success`：连接鉴权通过 → `{"status":1000,"data":{"uid":123}}`
+  * `game_updata`：**游戏状态推送**（20Hz；每 5 秒一次全量，其余为差量 `dict_diff`）
+  * `room_update`：房间成员变化广播（`type: 'join' | 'leave'`）
+
+* 客户端 → 服务端
+
+  * `join_room`：`{"token":"...","room_id":1}`
+
+    * 成功 `{"status":1000,"data":<room_info>}`
+  * `leave_room`：`{"token":"...","room_id":1}`
+
+    * 成功 `{"status":1000}`
+  * 错误：`error` 事件，`status` 与 HTTP 同语义
+
+---
+
+## TTapi 客户端用法
+
+`TTapi.py` 提供了简化调用。常见属性/方法（以你的实现为准）：
+
+* 地址：
+
+  ```python
+  base = "http://127.0.0.1"
+  login_url = f"{base}:25000/"
+  room_url  = f"{base}:25002/"
+  game_url  = f"{base}:25001/"
+  ```
+
+* 典型流程：
+
+  ```python
+  from TTapi import TTapi
+
+  api = TTapi(username="user1", password="pass1")
+  ret = api.login()
+  if ret == "login_success":
+      # token/uid 已在 api.token/api.uid
+      api.sio.connect(game_url, auth={'token': api.token})  # 你代码里已有
+      print(api.get_all_room_info())  # 拉取房间
+  elif ret == "user_banned":
+      print("该账号已被封禁，无法登录")
+  else:
+      print("登录失败:", ret)
+  ```
+
+* `login()` 返回值（字符串）：
+
+  * `login_success` / `parameter_error` / `password_error`
+  * `user_banned`（**新增**：服务端 `status==103`）
+  * `network_error` / `unknown_error`
 
 ---
 
 ## 返回码对照表
 
-| 场景                    | 返回值（字符串）           | 说明                                       |
-| --------------------- | ------------------ | ---------------------------------------- |
-| `register()`          | `regis_success`    | 注册成功（同时获得 `token`/`uid`，但 `status` 仍为 0） |
-|                       | `username_exist`   | 用户名已存在                                   |
-|                       | `parameter_error`  | 请求参数不合法/缺失                               |
-|                       | `network_error`    | 网络/超时等异常                                 |
-|                       | `unknown_error`    | 未归类异常                                    |
-|                       | `username_invalid` | 本地校验：用户名不符合格式                            |
-|                       | `password_invalid` | 本地校验：密码不符合格式                             |
-| `login()`             | `login_success`    | 登录成功并连接 SocketIO；`status=1`              |
-|                       | `parameter_error`  | 本地校验失败                                   |
-|                       | `password_error`   | 用户名或密码错                                  |
-|                       | `network_error`    | 网络/超时等异常                                 |
-|                       | `unknown_error`    | 未归类异常                                    |
-| `get_all_room_info()` | `not_login`        | 未登录或缺少 token                             |
-|                       | `token_error`      | token 无效                                 |
-|                       | `network_error`    | 网络错误                                     |
-|                       | `unknown_error`    | 未归类异常                                    |
-| `create_room()`       | `create_success`   | 创建成功（随后会自动尝试 join）                       |
-|                       | `not_login`        | 未登录/无 token                              |
-|                       | `token_error`      | token 无效                                 |
-|                       | `room_full`        | 达到房间上限                                   |
-|                       | `player_in_room`   | 已在其他房间                                   |
-|                       | `network_error`    | 网络错误                                     |
-|                       | `unknown_error`    | 未归类异常                                    |
+| 模块   | 码    | 说明                  |
+| ---- | ---- | ------------------- |
+| 登录   | 100  | 参数缺失/无效请求           |
+| 登录   | 101  | 用户名或密码错误            |
+| 登录   | 102  | 登录成功（返回 token, uid） |
+| 登录   | 103  | **用户被封禁（新增）**       |
+| 登录   | 500  | 服务器错误               |
+| 注册   | 200  | 参数缺失/无效请求           |
+| 注册   | 201  | 用户名已存在              |
+| 注册   | 202  | 注册成功（返回 token, uid） |
+| 注册   | 203  | IP 频率限制             |
+| 注册   | 204  | 同 IP 账号数上限          |
+| 房间   | 1000 | 成功                  |
+| 房间   | 1001 | token 无效            |
+| 房间   | 1002 | 参数缺失 / 满员 / 不存在等    |
+| 管理兼容 | 300  | 成功                  |
+| 管理兼容 | 301  | `ADMIN_TOKEN` 无效    |
+| 管理兼容 | 302  | 无效请求                |
+| 管理兼容 | 1000 | get\_token：有效       |
+| 管理兼容 | 1001 | get\_token：无效       |
 
 ---
 
-## 数据结构
+## 故障排查
 
-### `room_info(room_data) -> (room, players)`
+* **`jinja2.exceptions.UndefinedError: 'csrf_field' is undefined`**
+  使用美化模板时，需添加 `templates/admin/_macros.html` 并在每个页面顶部：
+  `{% import "admin/_macros.html" as ui %}`，然后用 `{{ ui.csrf_field(csrf) }}`。
+  如仍报错，检查 `render_template()` 是否传入了 `csrf`。
 
-* 简单拆分工具；`room` 即 `room_data`，`players` 为 `room_data['players']`（默认空列表）。
+* **WebSocket 连接不上**
+  确认：`login()` 已成功返回 `token`；WS 连接时 `auth={'token': token}`；端口 `25001` 未被防火墙拦截。
 
-### `user.room_data`（房间全量/合成后）
-
-* 通过 `on_join_room` / `on_room_updata` / `on_game_updata` 更新。
-* `on_game_updata` 内部使用 `dict_patch` 将差量补丁应用到 `room_data_temp` 基线，并回写到 `room_data`。
-
----
-
-## 最佳实践与注意事项
-
-1. **总是通过 `login()` 获取 token 并建立 SocketIO 连接。**
-2. 列表页请优先使用 `get_all_room_info()` 的 **精简视图**（内部已默认携带 `brief=1`，可极大减少流量）。
-3. 进入房间后，**不要频繁主动拉取**；依赖服务端的全量/差量推送即可。
-4. UI 层使用 `on('room_update', ...)` 与 `on('game_update', ...)` 即时刷新。
-5. 建议在退出房间后调用 `start_auto_refresh()` 恢复房间列表自动刷新；模块已在合适时机自动处理。
-6. 用户名/密码有本地严格校验，不符合规范不会发起网络请求。
-7. 若你需要统一日志，可替换/包装 `log_info()`。
+* **房间偶发 KeyError/并发异常**
+  建议对 `GAMEROOMS['room_list']` 的读写加全局锁（已在示例补丁中说明）。
 
 ---
 
-## Admin 类
+## 安全与上线建议
 
-当前为占位（仅保存 `token`），后续可扩展管理员接口调用封装：
-
-```python
-from TTapi import Admin
-admin = Admin(token="your_admin_token")
-```
+* 管理后台务必置于内网或开启鉴权（你已有登录与 CSRF；如有需要可加 CSP/TLS）。
+* `ADMIN_TOKEN` 仅用于兼容旧接口，不要暴露公网。
+* 部署建议：前置 Nginx/Caddy（TLS/限速/超时），后端运行单进程；Load balancer 横向扩展需改 Token 与房间状态为共享存储/消息总线。
+* 登录接口已加入**封禁校验**（`status=103`）。如有爆破风险，可开启轻微随机延时（50–150ms）。
 
 ---
 
-## 附：增量同步协议
-
-* 服务端：每 5 秒推送一次 **全量** 房间信息，其余 tick 推送 **差量**：
-
-  * 差量由 `dict_diff(old, new)` 生成
-* 客户端：在 `on_game_updata` 中：
-
-  * 使用 `dict_patch(old, diff)` 将差量应用到 `room_data_temp`
-  * 回写 `room_data` 与 `room_data_temp`，并据此更新 UI
-
-如需自定义你的状态合并逻辑，可直接复用本模块中提供的 `dict_diff / dict_patch` 工具函数。
-
-
+如需我把 README 拆成中/英双语版本，或生成一份 `curl`/Postman 集合，一条命令就能本地联调的脚本，我可以直接补上。
